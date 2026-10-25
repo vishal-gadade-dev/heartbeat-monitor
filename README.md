@@ -109,7 +109,7 @@ curl -X POST http://localhost:8080/checks \
   }'
 ```
 
-**Response (HTTP 200 OK):**
+**Response (HTTP 201 Created):**
 ```json
 {
   "id": 1,
@@ -266,7 +266,7 @@ Ping recorded successfully. Next expected at: 2026-10-24T04:00:00
 - The sweeper **never** calls `findAll()` (which would cause 86 million reads a day).
 - Four narrow index-range queries use the composite index `(kind, status, next_expected_at)`:
   - `(HEARTBEAT, UP, <= now)` · `(HEARTBEAT, LATE, <= now)` · `(WEBSITE, UP, <= now)` · `(WEBSITE, DOWN, <= now)`
-- Each query fetches up to **2,000 rows** per sweep tick. At 10,000 website checks on a 60-second interval, approximately 167 checks become due per 10-second sweep — well within a single page. Raise `SWEEP_PAGE_SIZE` in `CheckRepository` if check density grows further.
+- Each query fetches up to **2,000 rows** per sweep tick. At 10,000 website checks on a 60-second interval, approximately 1,667 checks become due per 10-second sweep (10,000 ÷ 6) — under the 2,000-row page, but with limited headroom. Raise `SWEEP_PAGE_SIZE` in `CheckRepository` if check density grows further.
 
 ### Rule 6: Slow Websites Do Not Block Sweeping (Thread Isolation)
 - Website probing uses the JDK non-blocking `HttpClient.sendAsync()` — zero blocking threads per probe.
@@ -277,7 +277,7 @@ Ping recorded successfully. Next expected at: 2026-10-24T04:00:00
 ### Resilient Webhook Delivery & Dead-Letter Queue (DLQ)
 - Alerts are dispatched asynchronously via non-blocking `HttpClient.sendAsync()`.
 - Broken receiver URLs do not block other alerts.
-- Retries follow **3× exponential backoff**: 5 min → 15 min → 45 min → 2h15m → 6h45m (≈11 h total window), covering the "dead for six hours" example from the assignment.
+- Retries follow **3× exponential backoff**: 5 min → 15 min → 45 min → 2h15m. After the fifth failure the alert moves to the dead-letter queue (about 3h20m in total) and can be re-queued with `POST /alerts/failed/{id}/retry`.
 - Exhausted retries (5 attempts) transition to `FAILED_PERMANENTLY` and are preserved for audit via `GET /alerts/failed`.
 - Permanently failed alerts can be re-queued for immediate re-delivery: `POST /alerts/failed/{id}/retry`.
 
@@ -298,7 +298,7 @@ src/main/java/com/monitor/heartbeat_monitor/
 │   └── enums/                        # CheckStatus (UP, LATE, DOWN, PAUSED), CheckKind
 ├── ping/                             # Fast ping ingestion
 │   ├── controller/PingController.java
-│   └── service/PingTxService.java    # Isolated REQUIRES_NEW transaction + collision retry
+│   └── service/PingTxService.java    # Single transaction under a pessimistic write lock
 ├── schedule/                         # Scheduling engine
 │   ├── ScheduleCalculator.java       # Interface
 │   └── impl/DefaultScheduleCalculator.java # 5-field UNIX Cron & Interval computation
@@ -326,7 +326,7 @@ src/main/java/com/monitor/heartbeat_monitor/
 │   ├── constant/HistoryMessages.java
 │   └── enums/HistoryEventType.java   # REGISTERED, PING, WEBSITE_PROBE, STATUS_CHANGE
 └── common/                           # Cross-cutting infrastructure
-    ├── config/                       # AppConfig, ThreadPoolConfig
+    ├── config/                       # AppConfig, SchedulingConfig
     ├── constant/LogMessages.java     # Centralized logging templates
     └── exception/                    # GlobalExceptionHandler, ResourceNotFoundException
 ```
@@ -337,7 +337,7 @@ src/main/java/com/monitor/heartbeat_monitor/
 ## 8. Assumptions & Trade-offs
 
 ### Assumptions Made
-1. **Interval unit is seconds** for `scheduleValue` when `scheduleType=interval`. All timing is server-side.
+1. **Interval unit is minutes** for `scheduleValue` when `scheduleType=interval` (`60` = every 60 minutes). Website checks use `websiteIntervalSeconds`. All timing is server-side.
 2. **Cron early-ping window is 5 minutes.** When a ping arrives and the stored deadline is still in the future but within 5 minutes, the next deadline is calculated from the stored slot — so an early ping at 02:59:50 for a 03:00 job correctly advances to tomorrow 03:00 with no false LATE alarm. Outside that window (stale deadline from a past outage, or repeated rapid pings), the calculation starts from `now` — preventing a stale-deadline from producing a past-due next slot and preventing deadline ratcheting from multiple rapid pings.
 3. **Grace period 0 is valid** — a check with `gracePeriodSeconds=0` goes directly from UP to DOWN with no LATE phase.
 4. **Website checks have no secretToken or pingUrl** — they are probed by the sweeper automatically.
@@ -348,3 +348,5 @@ src/main/java/com/monitor/heartbeat_monitor/
 - **Sweeper backpressure at extreme scale**: Each of the four index-range queries is capped at 2,000 rows. In the extreme case where more than 2,000 checks of the same kind/status become due simultaneously, excess rows are deferred to the next sweep (10 s). For this assignment's 10,000-check scenario this never occurs.
 - **Cron timezone**: Cron expressions use the server's system timezone. A future enhancement could accept a per-check timezone.
 - **No idempotency key on pings**: A network retry could create a duplicate PING history entry. The status transitions are idempotent (UP stays UP), but the history row count may differ.
+- **Alert delivery race:** a new alert is first sent from inside the open transaction, and the retry worker can also pick it up. In rare timing the same alert may be delivered twice. Making the worker the only sender would remove this.
+- **Probe threads and DB pool:** website probes use the JDK `HttpClient` default executor, which is not bounded, and the database connection pool uses the default size. Both would be tuned for production load.
